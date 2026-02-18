@@ -1041,7 +1041,10 @@ impl Playlist {
     pub fn is_playlist(url_or_id: impl Into<String>) -> bool {
         let url_or_id: String = url_or_id.into();
 
-        if PLAYLIST_ID.is_match(&url_or_id) || ALBUM_REGEX.is_match(&url_or_id) {
+        // Try extracting playlist ID from full URL query params (handles music.youtube.com etc.)
+        let check_str = Self::extract_list_param(&url_or_id).unwrap_or(url_or_id.clone());
+
+        if PLAYLIST_ID.is_match(&check_str) || ALBUM_REGEX.is_match(&check_str) {
             return true;
         }
 
@@ -1050,16 +1053,20 @@ impl Playlist {
 
     pub fn get_playlist_url(url_or_id: impl Into<String>) -> Option<String> {
         let url_or_id: String = url_or_id.into();
-        let matched_id = if PLAYLIST_ID.captures(&url_or_id).is_some() {
+
+        // Try extracting the `list` query parameter from full URLs first
+        let id_source = Self::extract_list_param(&url_or_id).unwrap_or(url_or_id);
+
+        let matched_id = if PLAYLIST_ID.captures(&id_source).is_some() {
             PLAYLIST_ID
-                .captures(&url_or_id)
+                .captures(&id_source)
                 .unwrap()
                 .get(0)
                 .map(|x| x.as_str())
                 .unwrap_or("")
-        } else if ALBUM_REGEX.captures(&url_or_id).is_some() {
+        } else if ALBUM_REGEX.captures(&id_source).is_some() {
             ALBUM_REGEX
-                .captures(&url_or_id)
+                .captures(&id_source)
                 .unwrap()
                 .get(0)
                 .map(|x| x.as_str())
@@ -1081,6 +1088,17 @@ impl Playlist {
         Some(format!(
             "https://www.youtube.com/playlist?list={matched_id}"
         ))
+    }
+
+    /// Extract the `list` query parameter from a YouTube/YouTube Music URL.
+    /// Returns `None` if the URL can't be parsed or has no `list` param.
+    fn extract_list_param(url_or_id: &str) -> Option<String> {
+        url::Url::parse(url_or_id).ok().and_then(|parsed| {
+            parsed
+                .query_pairs()
+                .find(|(key, _)| key == "list")
+                .map(|(_, value)| value.to_string())
+        })
     }
 
     fn get_playlist_videos(
@@ -1230,6 +1248,121 @@ impl Playlist {
         videos
     }
 
+    /// Download all playlist videos as audio-only files to a directory.
+    ///
+    /// Each video is downloaded sequentially. The audio stream is selected using
+    /// `VideoSearchOptions::Audio` with `VideoQuality::HighestAudio` by default.
+    ///
+    /// Returns a `Vec` of results — one per video. Each result contains the
+    /// output file path on success or a `VideoError` on failure. Partial failures
+    /// do not abort the remaining downloads.
+    ///
+    /// # Arguments
+    /// * `output_dir` — Directory to save audio files into (must exist)
+    /// * `video_options` — Optional custom [`VideoOptions`]; defaults to audio-only highest quality
+    ///
+    /// # Example
+    /// ```ignore
+    /// let playlist = Playlist::get("https://music.youtube.com/playlist?list=OLAK5uy_xxx", None).await.unwrap();
+    /// let results = playlist.download_audio("./downloads", None).await;
+    /// ```
+    pub async fn download_audio<P: AsRef<std::path::Path>>(
+        &self,
+        output_dir: P,
+        video_options: Option<crate::VideoOptions>,
+    ) -> Vec<Result<std::path::PathBuf, VideoError>> {
+        use crate::{VideoOptions, VideoQuality, VideoSearchOptions};
+
+        let output_dir = output_dir.as_ref();
+        let options = video_options.unwrap_or(VideoOptions {
+            quality: VideoQuality::Highest,
+            filter: VideoSearchOptions::VideoAudio,
+            ..Default::default()
+        });
+
+        let mut results = Vec::with_capacity(self.videos.len());
+
+        for video_entry in &self.videos {
+            let video_url = format!("https://www.youtube.com/watch?v={}", video_entry.id);
+
+            let result = async {
+                let video = crate::Video::new_with_options(&video_url, options.clone())?;
+                let filename = sanitize_filename(&video_entry.title, &video_entry.id, "m4a");
+                let file_path = output_dir.join(&filename);
+                video.download(&file_path).await?;
+                Ok(file_path)
+            }
+            .await;
+
+            results.push(result);
+        }
+
+        results
+    }
+
+    /// Download all playlist videos as MP3 files using FFmpeg.
+    ///
+    /// This is a convenience method that combines audio-only download with
+    /// FFmpeg MP3 conversion. Requires the `ffmpeg` feature and FFmpeg
+    /// installed on the system.
+    ///
+    /// Returns a `Vec` of results — one per video. Each result contains the
+    /// output file path on success or a `VideoError` on failure.
+    ///
+    /// # Arguments
+    /// * `output_dir` — Directory to save MP3 files into (must exist)
+    /// * `video_options` — Optional custom [`VideoOptions`]; defaults to audio-only highest quality
+    /// * `ffmpeg_args` — Optional custom [`FFmpegArgs`]; defaults to MP3 format output
+    ///
+    /// # Example
+    /// ```ignore
+    /// let playlist = Playlist::get("https://music.youtube.com/playlist?list=OLAK5uy_xxx", None).await.unwrap();
+    /// let results = playlist.download_audio_as_mp3("./downloads", None, None).await;
+    /// ```
+    #[cfg(feature = "ffmpeg")]
+    pub async fn download_audio_as_mp3<P: AsRef<std::path::Path>>(
+        &self,
+        output_dir: P,
+        video_options: Option<crate::VideoOptions>,
+        ffmpeg_args: Option<crate::FFmpegArgs>,
+    ) -> Vec<Result<std::path::PathBuf, VideoError>> {
+        use crate::{FFmpegArgs, VideoOptions, VideoQuality, VideoSearchOptions};
+
+        let output_dir = output_dir.as_ref();
+        let options = video_options.unwrap_or(VideoOptions {
+            quality: VideoQuality::Highest,
+            filter: VideoSearchOptions::VideoAudio,
+            ..Default::default()
+        });
+
+        let ffmpeg = ffmpeg_args.unwrap_or(FFmpegArgs {
+            format: Some("mp3".to_string()),
+            audio_filter: None,
+            video_filter: None,
+        });
+
+        let mut results = Vec::with_capacity(self.videos.len());
+
+        for video_entry in &self.videos {
+            let video_url = format!("https://www.youtube.com/watch?v={}", video_entry.id);
+
+            let result = async {
+                let video = crate::Video::new_with_options(&video_url, options.clone())?;
+                let filename = sanitize_filename(&video_entry.title, &video_entry.id, "mp3");
+                let file_path = output_dir.join(&filename);
+                video
+                    .download_with_ffmpeg(&file_path, Some(ffmpeg.clone()))
+                    .await?;
+                Ok(file_path)
+            }
+            .await;
+
+            results.push(result);
+        }
+
+        results
+    }
+
     fn get_continuation_token(context: &serde_json::Value) -> Option<String> {
         // if context is not array return none
         if !context.is_array() {
@@ -1254,6 +1387,27 @@ impl Playlist {
         } else {
             None
         }
+    }
+}
+
+/// Sanitize a video title into a safe filename.
+/// Removes characters that are invalid in file paths across platforms.
+fn sanitize_filename(title: &str, fallback_id: &str, extension: &str) -> String {
+    let sanitized: String = title
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+
+    let sanitized = sanitized.trim().trim_matches('.');
+
+    if sanitized.is_empty() {
+        format!("{}.{}", fallback_id, extension)
+    } else {
+        format!("{}.{}", sanitized, extension)
     }
 }
 

@@ -92,3 +92,8 @@ required-features = ["search"]
 name = "suggestion"
 path = "examples/suggestion.rs"
 required-features = ["search"]
+
+[[example]]
+name = "download_playlist_mp3"
+path = "examples/download_playlist_mp3.rs"
+required-features = ["search", "ffmpeg"]
